@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# gh-keybars: your pull requests' checks and reviews, and reviews asked of
+# you, on the keyboard through keybars Pro, with no webhooks to set up. It
+# polls GitHub through gh and sends what changed as keybars Pro's GitHub
+# events, so the marketplace's GitHub packs play them.
+set -euo pipefail
+
+kp=${KEYBARS_PRO:-keybars-pro}
+state_dir=${GH_KEYBARS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/gh-keybars}
+seen="$state_dir/seen"
+pidfile="$state_dir/pid"
+
+usage() {
+  cat <<'EOF'
+usage: gh keybars watch [-i seconds]   check every minute (or -i), sending what changed
+       gh keybars start [-i seconds]   watch in the background
+       gh keybars stop                 stop it
+       gh keybars status               whether it's watching
+       gh keybars once [-n]            check now; -n prints the events instead of sending them
+
+Events: ci.running, ci.passed, ci.failed, review.approved,
+review.changes_requested, pull_request.merged on your pull requests;
+pull_request.review_requested when someone asks you. The marketplace's
+GitHub packs play them: keybars-pro market install github-ci-pack review-nudges merge-confetti
+EOF
+}
+
+die() {
+  echo "gh-keybars: $*" >&2
+  exit 1
+}
+
+# shellcheck disable=SC2016 # GraphQL's variables, not the shell's
+query='query($mine: String!, $asked: String!) {
+  mine: search(query: $mine, type: ISSUE, first: 50) {
+    nodes {
+      ... on PullRequest {
+        number state reviewDecision headRefName baseRefName
+        repository { nameWithOwner }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      }
+    }
+  }
+  asked: search(query: $asked, type: ISSUE, first: 50) {
+    nodes { ... on PullRequest { number baseRefName repository { nameWithOwner } } }
+  }
+}'
+
+# a line each: kind repo number state checks review head base, tab-separated
+jq='(.data.mine.nodes[] | select(.number) | ["pr", .repository.nameWithOwner, (.number|tostring), .state,
+  (.commits.nodes[0].commit.statusCheckRollup.state // ""), (.reviewDecision // ""), .headRefName, .baseRefName] | join("\t")),
+(.data.asked.nodes[] | select(.number) | ["ask", .repository.nameWithOwner, (.number|tostring), "", "", "", "", .baseRefName] | join("\t"))'
+
+since() {
+  date -u -d "-$1 days" +%F 2>/dev/null || date -u -v-"$1"d +%F 2>/dev/null
+}
+
+fetch() {
+  gh api graphql -f query="$query" \
+    -f mine="is:pr author:@me -is:closed-unmerged updated:>=$(since 7)" \
+    -f asked="is:open is:pr review-requested:@me" \
+    --jq "$jq"
+}
+
+# events <before> <now>: what changed, a line each: event repo branch
+events() {
+  awk -F'\t' -v OFS='\t' '
+    NR == FNR { old[$1 FS $2 FS $3] = $0; next }
+    {
+      key = $1 FS $2 FS $3
+      known = key in old
+      split(known ? old[key] : "", was, FS)
+      if ($1 == "ask") {
+        if (!known) print "pull_request.review_requested", $2, $8
+        next
+      }
+      if ($4 == "MERGED") {
+        if (was[4] == "OPEN") print "pull_request.merged", $2, $8
+        next
+      }
+      if ($5 != was[5]) {
+        if ($5 == "SUCCESS") print "ci.passed", $2, $7
+        else if ($5 == "FAILURE" || $5 == "ERROR") print "ci.failed", $2, $7
+        else if ($5 == "PENDING" || $5 == "EXPECTED") print "ci.running", $2, $7
+      }
+      if ($6 != was[6]) {
+        if ($6 == "APPROVED") print "review.approved", $2, $8
+        else if ($6 == "CHANGES_REQUESTED") print "review.changes_requested", $2, $8
+      }
+    }' "$1" "$2"
+}
+
+# once [-n]: check, send what changed since last time, remember it. The
+# first check only remembers, so starting doesn't replay old news.
+once() {
+  local print=${1:-}
+  mkdir -p "$state_dir"
+  local now
+  now=$(mktemp "$state_dir/now.XXXXXX")
+  if ! fetch >"$now"; then
+    rm -f "$now"
+    return 1
+  fi
+  if [ -f "$seen" ]; then
+    local event repo branch
+    while IFS=$'\t' read -r event repo branch; do
+      if [ -n "$print" ]; then
+        printf '%s %s %s\n' "$event" "$repo" "$branch"
+      else
+        "$kp" alert -q -source github -repo "$repo" ${branch:+-branch "$branch"} "$event" >/dev/null 2>&1 || true
+      fi
+    done < <(events "$seen" "$now")
+  fi
+  if [ -n "$print" ] && [ -f "$seen" ]; then
+    rm -f "$now"
+  else
+    mv "$now" "$seen"
+  fi
+}
+
+interval() {
+  local every=60
+  if [ "${1:-}" = -i ]; then
+    [[ ${2:-} =~ ^[0-9]+$ ]] && [ "$2" -ge 15 ] || die "-i wants seconds, 15 or more"
+    every=$2
+  fi
+  echo "$every"
+}
+
+watching() {
+  [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null
+}
+
+command -v gh >/dev/null || die "needs gh"
+cmd=${1:-}
+[ $# -eq 0 ] || shift
+case $cmd in
+watch)
+  every=$(interval "$@")
+  while true; do
+    once || echo "gh-keybars: couldn't reach GitHub; trying again in ${every}s" >&2
+    sleep "$every"
+  done
+  ;;
+start)
+  every=$(interval "$@")
+  watching && die "already watching (pid $(cat "$pidfile"))"
+  mkdir -p "$state_dir"
+  nohup "$0" watch -i "$every" >"$state_dir/log" 2>&1 &
+  echo $! >"$pidfile"
+  echo "gh-keybars: watching every ${every}s (log: $state_dir/log)"
+  ;;
+stop)
+  watching || die "not watching"
+  kill "$(cat "$pidfile")"
+  rm -f "$pidfile"
+  echo "gh-keybars: stopped"
+  ;;
+status)
+  if watching; then echo "watching (pid $(cat "$pidfile"))"; else echo "not watching"; fi
+  ;;
+once)
+  if [ "${1:-}" = -n ]; then once print; else once; fi
+  ;;
+help | -h | --help) usage ;;
+*)
+  usage >&2
+  exit 2
+  ;;
+esac
