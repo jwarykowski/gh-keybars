@@ -9,10 +9,8 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    container:
+      image: localhost/forgejo-job:1
     steps:
-      - uses: actions/checkout@v4
-      - name: shellcheck
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q shellcheck
+      - uses: https://code.forgejo.org/actions/checkout@v4
       - run: make check
