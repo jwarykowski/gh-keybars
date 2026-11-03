@@ -121,7 +121,7 @@ once() {
 interval() {
   local every=60
   if [ "${1:-}" = -i ]; then
-    [[ ${2:-} =~ ^[0-9]+$ ]] && [ "$2" -ge 15 ] || die "-i wants seconds, 15 or more"
+    if ! [[ ${2:-} =~ ^[0-9]+$ ]] || [ "$2" -lt 15 ]; then die "-i wants seconds, 15 or more"; fi
     every=$2
   fi
   echo "$every"
